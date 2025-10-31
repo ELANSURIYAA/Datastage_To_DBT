@@ -1,0 +1,171 @@
+=============================================
+Author:        Ascendion AAVA
+Created on:   
+Description:   SCD Type-2 load for DIM_POLICY with Oracle source/target and ETL_AUDIT_LOG audit framework
+=============================================
+
+# DataStage Job Analysis: SCD2_DIM_POLICY_Load
+
+## 1. Job Overview
+
+### ETL Logic Summary
+The SCD2_DIM_POLICY job implements a Slowly Changing Dimension Type 2 pattern for maintaining historical policy data. The job reads policy records from Oracle staging table (STAGING.POLICY_SRC), performs change detection against existing dimension records, and applies SCD Type 2 operations to preserve historical versions while maintaining current active records in the target dimension table (DWH.DIM_POLICY).
+
+### Business Purpose
+This job automates the critical business process of maintaining accurate policy dimension data for business intelligence and reporting systems. It ensures historical policy information is preserved for trend analysis, tracks policy changes with effective dates, maintains data quality through validation, and provides comprehensive audit trails for compliance monitoring.
+
+### dbt Layer Mapping
+- **Staging Layer**: Source data extraction from STAGING.POLICY_SRC would map to dbt staging models (stg_policy_src.sql)
+- **Intermediate Layer**: Change detection logic and SCD preparation would be implemented as intermediate models (int_policy_changes.sql)
+- **Mart Layer**: Final dimension table population would be handled by mart models (dim_policy.sql) using dbt snapshots for SCD Type 2
+
+## 2. Complexity Metrics
+
+| Category | Measurement |
+|----------|-------------|
+| Number of Stages | 8 |
+| Source/Target Systems | Oracle Database (source and target) |
+| Transformation Stages | 3 (Lookup, Transformer, SCD Manager) |
+| Parameters Used | 6 (SRC_CONN, TGT_CONN, RUN_DATE, COMMIT_BATCH, LOG_PATH, BATCH_ID) |
+| Reusable Components | 2 (Oracle connection objects) |
+| Control Logic | Before/After job audit procedures with stored procedure calls |
+| External Dependencies | Oracle connections, ETL_AUDIT_LOG table, file system access |
+| Performance Considerations | Hash partitioning, cached lookups, batch commits, parallel processing |
+| Volume Handling | Configurable commit batches, partitioned processing, optimized for large datasets |
+| Error Handling | Comprehensive reject processing, validation logic, audit error tracking |
+| Overall Complexity Score | 75 |
+| Conversion Complexity Rating | High - Complex SCD Type 2 logic with multiple transformation stages, audit framework integration, and sophisticated change detection requiring significant dbt refactoring |
+
+## 3. Syntax Differences and Mapping
+
+### DataStage to dbt/Snowflake Syntax Mapping
+
+**Oracle Connector → dbt Source**
+```sql
+-- DataStage Oracle Connector SQL
+SELECT POLICY_ID, POLICY_HOLDER_NAME, POLICY_TYPE, PREMIUM_AMOUNT, START_DATE, END_DATE, UPDATED_DATE, SOURCE_SYSTEM 
+FROM STAGING.POLICY_SRC 
+WHERE UPDATED_DATE <= TO_DATE('$$RUN_DATE','YYYY-MM-DD')
+
+-- dbt equivalent
+{{ config(materialized='view') }}
+select 
+    policy_id,
+    policy_holder_name,
+    policy_type,
+    premium_amount,
+    start_date,
+    end_date,
+    updated_date,
+    source_system
+from {{ source('staging', 'policy_src') }}
+where updated_date <= '{{ var("run_date") }}'
+```
+
+**Lookup Stage → dbt ref() and joins**
+```sql
+-- DataStage Cached Lookup
+SELECT POLICY_KEY, POLICY_ID, POLICY_HOLDER_NAME, POLICY_TYPE, PREMIUM_AMOUNT, START_DATE, END_DATE, EFFECTIVE_FROM, EFFECTIVE_TO, CURRENT_FLAG, VERSION_NO 
+FROM DWH.DIM_POLICY 
+WHERE CURRENT_FLAG = 'Y'
+
+-- dbt equivalent using ref()
+select * from {{ ref('dim_policy') }} where current_flag = 'Y'
+```
+
+**Transformer Expressions → dbt SQL**
+```sql
+-- DataStage Transformer Expression
+MATCHED = (LK_POLICY_ID IS NOT NULL);
+ATTR_CHANGED = ( (NVL(POLICY_HOLDER_NAME,'~') <> NVL(LK_POLICY_HOLDER_NAME,'~')) OR ... );
+
+-- dbt equivalent
+select *,
+    case when lk_policy_id is not null then true else false end as matched,
+    case when (
+        coalesce(policy_holder_name, '~') != coalesce(lk_policy_holder_name, '~') or
+        coalesce(policy_type, '~') != coalesce(lk_policy_type, '~') or
+        coalesce(premium_amount::string, '~') != coalesce(lk_premium_amount::string, '~')
+    ) then true else false end as attr_changed
+```
+
+**SCD Manager → dbt Snapshots**
+```sql
+-- DataStage SCD Manager configuration would become dbt snapshot
+{{ config(
+    target_schema='dwh',
+    unique_key='policy_id',
+    strategy='check',
+    check_cols=['policy_holder_name', 'policy_type', 'premium_amount', 'start_date', 'end_date']
+) }}
+```
+
+## 4. Manual Adjustments Required
+
+### Parameter Conversion
+- Convert DataStage parameters ($$SRC_CONN, $$TGT_CONN, $$RUN_DATE) to dbt variables using `{{ var() }}` function
+- Replace BATCH_ID parameter logic with dbt run metadata using `{{ run_started_at }}`
+- Convert COMMIT_BATCH parameter to Snowflake warehouse sizing configuration
+
+### Audit Framework Migration
+- Replace Oracle stored procedure calls (AUDIT_INSERT, AUDIT_UPDATE) with dbt hooks
+- Implement pre-hook and post-hook macros for audit logging
+- Convert ETL_AUDIT_LOG table operations to Snowflake-compatible SQL
+
+### Complex Expression Logic
+- Refactor NULL-safe comparison expressions using Snowflake COALESCE and NVL functions
+- Convert Oracle TO_DATE functions to Snowflake DATE/TIMESTAMP conversion functions
+- Rewrite IIF expressions using CASE WHEN statements
+
+### Error Handling
+- Replace DataStage reject link processing with dbt data quality tests
+- Implement dbt test macros for validation rules (POLICY_ID NOT NULL)
+- Create separate models for handling data quality issues
+
+### SCD Type 2 Implementation
+- Replace SCD Manager stage with dbt snapshots strategy
+- Implement custom macros for complex SCD logic if needed
+- Handle version numbering and effective dating through snapshot configuration
+
+## 5. Optimization Techniques
+
+### dbt Model Optimization
+- **Incremental Models**: Convert delta processing logic to dbt incremental models using `is_incremental()` macro
+- **Materializations**: Use appropriate materializations (table for dimension, view for staging)
+- **Partitioning**: Implement Snowflake clustering on POLICY_ID for performance
+- **Indexing**: Leverage Snowflake automatic clustering and search optimization
+
+### Snowflake Performance Enhancements
+- **Warehouse Sizing**: Configure appropriate warehouse size for processing volumes
+- **Clustering Keys**: Define clustering on frequently queried columns (POLICY_ID, EFFECTIVE_FROM)
+- **Result Caching**: Leverage Snowflake's automatic result caching for repeated queries
+- **Micro-partitions**: Optimize table design for Snowflake's micro-partition architecture
+
+### Refactor vs Rebuild Recommendation
+**Recommendation: Hybrid Approach**
+- **Refactor**: Core business logic and change detection algorithms can be refactored to dbt SQL
+- **Rebuild**: Audit framework and SCD implementation should be rebuilt using dbt snapshots and hooks
+- **Rationale**: The complex SCD Type 2 logic and audit framework require significant architectural changes that are better served by rebuilding with dbt best practices rather than direct translation
+
+### Additional Optimizations
+- Implement dbt documentation and lineage for better maintainability
+- Use dbt tests for data quality validation replacing DataStage reject processing
+- Leverage dbt packages for common SCD patterns if available
+- Implement proper error handling using dbt's built-in testing framework
+
+## 6. Migration Recommendations
+
+### Implementation Strategy
+1. **Phase 1**: Create staging models for source data extraction
+2. **Phase 2**: Implement intermediate models for change detection logic
+3. **Phase 3**: Set up dbt snapshots for SCD Type 2 functionality
+4. **Phase 4**: Implement audit framework using dbt hooks and macros
+5. **Phase 5**: Add comprehensive testing and documentation
+
+### Risk Mitigation
+- Extensive testing of SCD logic with historical data samples
+- Parallel run validation between DataStage and dbt implementations
+- Comprehensive data quality testing to replace reject processing
+- Performance testing with production-like data volumes
+
+apiCost: 0.025587 USD
