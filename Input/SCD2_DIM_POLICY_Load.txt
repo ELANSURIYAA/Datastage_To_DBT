@@ -1,0 +1,296 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  SCD2_DIM_POLICY_Full.dsx
+  Full Parallel Job DSX export for IBM InfoSphere DataStage (11.7 / 12.x)
+  Job: SCD2_DIM_POLICY
+  Description: SCD Type-2 load for DIM_POLICY with Oracle source/target and ETL_AUDIT_LOG audit framework.
+  NOTE: After import, update DataStage connection objects for $$SRC_CONN and $$TGT_CONN.
+-->
+
+<DSX ExportVersion="1.0">
+  <Job Name="SCD2_DIM_POLICY" Type="Parallel" Description="SCD Type-2 load for DIM_POLICY (Oracle source & target) with audit">
+    <!-- Job parameters -->
+    <Parameters>
+      <Parameter Name="SRC_CONN" Default="ORACLE_SRC_POLICY" Type="String" Description="Oracle source connection object name"/>
+      <Parameter Name="TGT_CONN" Default="ORACLE_DWH" Type="String" Description="Oracle target connection object name"/>
+      <Parameter Name="RUN_DATE" Default="2025-10-28" Type="Date" Description="Run date (YYYY-MM-DD) used as effective date"/>
+      <Parameter Name="COMMIT_BATCH" Default="10000" Type="Integer" Description="DB commit batch size"/>
+      <Parameter Name="LOG_PATH" Default="/var/ds/logs" Type="String" Description="Path for reject/audit files"/>
+      <Parameter Name="BATCH_ID" Default="BATCH_$$DATE" Type="String" Description="Batch identifier for audit"/>
+    </Parameters>
+
+    <!-- Stages -->
+    <Stages>
+
+      <!-- Oracle Source Stage -->
+      <Stage Name="SRC_POLICY" Type="OracleConnector" Description="Oracle - Source: STAGING.POLICY_SRC">
+        <Properties>
+          <Property Name="Connection" Value="$$SRC_CONN"/>
+          <Property Name="Schema" Value="STAGING"/>
+          <Property Name="Table" Value="POLICY_SRC"/>
+          <Property Name="SQL" Value="SELECT POLICY_ID, POLICY_HOLDER_NAME, POLICY_TYPE, PREMIUM_AMOUNT, START_DATE, END_DATE, UPDATED_DATE, SOURCE_SYSTEM FROM STAGING.POLICY_SRC WHERE UPDATED_DATE &lt;= TO_DATE('$$RUN_DATE','YYYY-MM-DD')"/>
+          <Property Name="Columns">
+            <![CDATA[
+              POLICY_ID:NUMBER,
+              POLICY_HOLDER_NAME:VARCHAR2(100),
+              POLICY_TYPE:VARCHAR2(50),
+              PREMIUM_AMOUNT:NUMBER(10,2),
+              START_DATE:DATE,
+              END_DATE:DATE,
+              UPDATED_DATE:DATE,
+              SOURCE_SYSTEM:VARCHAR2(50)
+            ]]>
+          </Property>
+          <Property Name="Partitioning" Value="Auto"/>
+        </Properties>
+      </Stage>
+
+      <!-- Lookup Stage: current rows from DIM_POLICY -->
+      <Stage Name="LOOKUP_DIM_POLICY" Type="Lookup" Description="Lookup current rows from DWH.DIM_POLICY (CURRENT_FLAG='Y')">
+        <Properties>
+          <Property Name="LookupConnection" Value="$$TGT_CONN"/>
+          <Property Name="LookupSchema" Value="DWH"/>
+          <Property Name="LookupSQL" Value="SELECT POLICY_KEY, POLICY_ID, POLICY_HOLDER_NAME, POLICY_TYPE, PREMIUM_AMOUNT, START_DATE, END_DATE, EFFECTIVE_FROM, EFFECTIVE_TO, CURRENT_FLAG, VERSION_NO FROM DWH.DIM_POLICY WHERE CURRENT_FLAG = 'Y'"/>
+          <Property Name="LookupColumns">
+            <![CDATA[
+              POLICY_KEY:NUMBER,
+              POLICY_ID:NUMBER,
+              POLICY_HOLDER_NAME:VARCHAR2(100),
+              POLICY_TYPE:VARCHAR2(50),
+              PREMIUM_AMOUNT:NUMBER(10,2),
+              START_DATE:DATE,
+              END_DATE:DATE,
+              EFFECTIVE_FROM:DATE,
+              EFFECTIVE_TO:DATE,
+              CURRENT_FLAG:CHAR(1),
+              VERSION_NO:NUMBER
+            ]]>
+          </Property>
+          <Property Name="MatchKeys" Value="POLICY_ID"/>
+          <Property Name="LookupType" Value="Cached"/>
+          <Property Name="Partitioning" Value="Hash(POLICY_ID)"/>
+        </Properties>
+      </Stage>
+
+      <!-- Transformer: detect new/changed/unchanged and prepare outputs -->
+      <Stage Name="TRANS_DETECT" Type="Transformer" Description="Detect new / changed rows; prepare SCD fields">
+        <Properties>
+          <Property Name="InputColumns">
+            <![CDATA[
+              POLICY_ID:NUMBER,
+              POLICY_HOLDER_NAME:VARCHAR2(100),
+              POLICY_TYPE:VARCHAR2(50),
+              PREMIUM_AMOUNT:NUMBER(10,2),
+              START_DATE:DATE,
+              END_DATE:DATE,
+              UPDATED_DATE:DATE,
+              SOURCE_SYSTEM:VARCHAR2(50),
+
+              -- lookup columns (prefix LK_)
+              LK_POLICY_KEY:NUMBER,
+              LK_POLICY_ID:NUMBER,
+              LK_POLICY_HOLDER_NAME:VARCHAR2(100),
+              LK_POLICY_TYPE:VARCHAR2(50),
+              LK_PREMIUM_AMOUNT:NUMBER(10,2),
+              LK_START_DATE:DATE,
+              LK_END_DATE:DATE,
+              LK_EFFECTIVE_FROM:DATE,
+              LK_EFFECTIVE_TO:DATE,
+              LK_CURRENT_FLAG:CHAR(1),
+              LK_VERSION_NO:NUMBER
+            ]]>
+          </Property>
+          <Property Name="Expressions">
+            <![CDATA[
+              -- Match detection
+              MATCHED = (LK_POLICY_ID IS NOT NULL);
+
+              -- Attribute comparison (NULL-safe)
+              ATTR_CHANGED =
+                ( (NVL(POLICY_HOLDER_NAME,'~') <> NVL(LK_POLICY_HOLDER_NAME,'~')) OR
+                  (NVL(POLICY_TYPE,'~') <> NVL(LK_POLICY_TYPE,'~')) OR
+                  (NVL(TO_CHAR(PREMIUM_AMOUNT),'~') <> NVL(TO_CHAR(LK_PREMIUM_AMOUNT),'~')) OR
+                  (NVL(TO_CHAR(START_DATE,'YYYY-MM-DD'),'~') <> NVL(TO_CHAR(LK_START_DATE,'YYYY-MM-DD'),'~')) OR
+                  (NVL(TO_CHAR(END_DATE,'YYYY-MM-DD'),'~') <> NVL(TO_CHAR(LK_END_DATE,'YYYY-MM-DD'),'~'))
+                );
+
+              NEW_RECORD = NOT MATCHED;
+              CHANGED = MATCHED AND ATTR_CHANGED;
+              UNCHANGED = MATCHED AND (NOT ATTR_CHANGED);
+
+              -- Output SCD values
+              OUT_VERSION_NO = IIF(NEW_RECORD, 1, (LK_VERSION_NO + 1));
+              OUT_EFFECTIVE_FROM = TO_DATE('$$RUN_DATE','YYYY-MM-DD');
+              OUT_EFFECTIVE_TO = NULL;
+              OUT_CURRENT_FLAG = 'Y';
+
+              -- Expire date for previous record
+              EXPIRE_DATE = TO_DATE(TO_CHAR(TO_DATE('$$RUN_DATE','YYYY-MM-DD') - 1,'YYYY-MM-DD'),'YYYY-MM-DD');
+
+              -- Pass-through / audit fields
+              OUT_SOURCE_SYSTEM = SOURCE_SYSTEM;
+              OUT_UPDATED_DATE = UPDATED_DATE;
+
+              -- Validation: ensure POLICY_ID not null
+              VALID = (POLICY_ID IS NOT NULL);
+              ERROR_DESC = IIF(VALID, '', 'POLICY_ID is NULL');
+            ]]>
+          </Property>
+          <Property Name="Outputs">
+            <![CDATA[
+              -- TO_INSERT: NEW_RECORD OR CHANGED (new version insert)
+              -- TO_EXPIRE: CHANGED (expire existing current record)
+              -- TO_REJECT: NOT VALID or other validation failures
+            ]]>
+          </Property>
+        </Properties>
+      </Stage>
+
+      <!-- SCD Manager Stage (Type 2) -->
+      <Stage Name="SCD_MANAGER" Type="SlowlyChangingDimension" Description="SCD Type 2 Manager to apply inserts/updates">
+        <Properties>
+          <Property Name="TargetConnection" Value="$$TGT_CONN"/>
+          <Property Name="TargetSchema" Value="DWH"/>
+          <Property Name="TargetTable" Value="DIM_POLICY"/>
+          <Property Name="NaturalKey" Value="POLICY_ID"/>
+          <Property Name="Attributes">
+            <![CDATA[
+              POLICY_HOLDER_NAME,
+              POLICY_TYPE,
+              PREMIUM_AMOUNT,
+              START_DATE,
+              END_DATE
+            ]]>
+          </Property>
+          <Property Name="SCDMode" Value="Type2"/>
+          <Property Name="VersionColumn" Value="VERSION_NO"/>
+          <Property Name="EffectiveDateColumn" Value="EFFECTIVE_FROM"/>
+          <Property Name="EndDateColumn" Value="EFFECTIVE_TO"/>
+          <Property Name="CurrentFlagColumn" Value="CURRENT_FLAG"/>
+          <Property Name="InsertStrategy" Value="InsertNewVersion"/>
+          <Property Name="ExpireStrategy" Value="SetCurrentToNAndSetEndDate"/>
+          <Property Name="ExpireDateExpression" Value="TO_DATE(TO_CHAR(TO_DATE('$$RUN_DATE','YYYY-MM-DD') - 1,'YYYY-MM-DD'),'YYYY-MM-DD')"/>
+          <Property Name="CommitBatch" Value="$$COMMIT_BATCH"/>
+          <Property Name="Partitioning" Value="Hash(POLICY_ID)"/>
+          <Property Name="RejectLink" Value="TO_REJECT"/>
+          <Property Name="AuditTable" Value="DWH.DIM_POLICY_AUDIT"/>
+        </Properties>
+      </Stage>
+
+      <!-- Oracle Target Stage -->
+      <Stage Name="TGT_DIM_POLICY" Type="OracleConnector" Description="Oracle - Target: DWH.DIM_POLICY">
+        <Properties>
+          <Property Name="Connection" Value="$$TGT_CONN"/>
+          <Property Name="Schema" Value="DWH"/>
+          <Property Name="Table" Value="DIM_POLICY"/>
+          <Property Name="Columns">
+            <![CDATA[
+              POLICY_KEY:NUMBER,
+              POLICY_ID:NUMBER,
+              POLICY_HOLDER_NAME:VARCHAR2(100),
+              POLICY_TYPE:VARCHAR2(50),
+              PREMIUM_AMOUNT:NUMBER(10,2),
+              START_DATE:DATE,
+              END_DATE:DATE,
+              EFFECTIVE_FROM:DATE,
+              EFFECTIVE_TO:DATE,
+              CURRENT_FLAG:CHAR(1),
+              VERSION_NO:NUMBER,
+              SOURCE_SYSTEM:VARCHAR2(50),
+              UPDATED_DATE:DATE,
+              BATCH_ID:VARCHAR2(50)
+            ]]>
+          </Property>
+          <Property Name="CommitBatch" Value="$$COMMIT_BATCH"/>
+          <Property Name="IsolationLevel" Value="READ_COMMITTED"/>
+          <Property Name="Partitioning" Value="Hash(POLICY_ID)"/>
+        </Properties>
+      </Stage>
+
+      <!-- Rejects Sequential File -->
+      <Stage Name="REJECTS" Type="SequentialFile" Description="Rejected rows and validation errors">
+        <Properties>
+          <Property Name="FilePath" Value="$$LOG_PATH/dim_policy_rejects_$$RUN_DATE.txt"/>
+          <Property Name="Delimiter" Value="|"/>
+          <Property Name="Columns" Value="POLICY_ID,ERROR_DESC,RAW_DATA"/>
+          <Property Name="Partitioning" Value="Single"/>
+        </Properties>
+      </Stage>
+
+      <!-- Audit Update Routine Stage (Stored Procedure) for AfterJob update -->
+      <Stage Name="AUDIT_UPDATE" Type="OracleStoredProcedure" Description="Update ETL_AUDIT_LOG after job">
+        <Properties>
+          <Property Name="Connection" Value="$$TGT_CONN"/>
+          <Property Name="CallSQL" Value="BEGIN UPDATE ETL_AUDIT_LOG SET END_TIME = SYSTIMESTAMP, SOURCE_COUNT = :SOURCE_COUNT, TARGET_INSERTS = :TARGET_INSERTS, TARGET_UPDATES = :TARGET_UPDATES, STATUS = :STATUS, ERROR_MESSAGE = :ERROR_MESSAGE WHERE JOB_NAME = 'SCD2_DIM_POLICY' AND BATCH_ID = :BATCH_ID; COMMIT; END;"/>
+          <Property Name="Parameters">
+            <![CDATA[
+              SOURCE_COUNT:NUMBER,
+              TARGET_INSERTS:NUMBER,
+              TARGET_UPDATES:NUMBER,
+              STATUS:VARCHAR2(20),
+              ERROR_MESSAGE:VARCHAR2(4000),
+              BATCH_ID:VARCHAR2(50)
+            ]]>
+          </Property>
+        </Properties>
+      </Stage>
+
+      <!-- Audit Insert Routine Stage (BeforeJob) -->
+      <Stage Name="AUDIT_INSERT" Type="OracleStoredProcedure" Description="Insert row into ETL_AUDIT_LOG before job">
+        <Properties>
+          <Property Name="Connection" Value="$$TGT_CONN"/>
+          <Property Name="CallSQL" Value="BEGIN INSERT INTO ETL_AUDIT_LOG (JOB_NAME, BATCH_ID, START_TIME, STATUS) VALUES ('SCD2_DIM_POLICY', :BATCH_ID, SYSTIMESTAMP, 'RUNNING'); COMMIT; END;"/>
+          <Property Name="Parameters">
+            <![CDATA[
+              BATCH_ID:VARCHAR2(50)
+            ]]>
+          </Property>
+        </Properties>
+      </Stage>
+
+    </Stages>
+
+    <!-- Links between stages -->
+    <Links>
+      <Link Name="L_SRC_to_LOOKUP" From="SRC_POLICY" To="LOOKUP_DIM_POLICY" Partition="Hash(POLICY_ID)"/>
+      <Link Name="L_SRC_to_TRANS" From="SRC_POLICY" To="TRANS_DETECT" Partition="Hash(POLICY_ID)"/>
+      <Link Name="L_LOOKUP_to_TRANS" From="LOOKUP_DIM_POLICY" To="TRANS_DETECT" Partition="Hash(POLICY_ID)"/>
+      <Link Name="L_TRANS_to_SCD" From="TRANS_DETECT" To="SCD_MANAGER" Partition="Hash(POLICY_ID)"/>
+      <Link Name="L_SCD_to_TGT" From="SCD_MANAGER" To="TGT_DIM_POLICY" Partition="Hash(POLICY_ID)"/>
+      <Link Name="L_SCD_to_REJECT" From="SCD_MANAGER" To="REJECTS" Partition="Single"/>
+      <Link Name="L_AUDIT_INSERT" From="AUDIT_INSERT" To="SRC_POLICY" Partition="Single"/>
+      <Link Name="L_AUDIT_UPDATE" From="TGT_DIM_POLICY" To="AUDIT_UPDATE" Partition="Single"/>
+    </Links>
+
+    <!-- JobControl: Before and After SQL for audit management -->
+    <JobControl>
+      <![CDATA[
+        -- BEFORE JOB: Insert audit record
+        BEGIN
+          -- Insert audit record with BATCH_ID parameter
+          DBMS_OUTPUT.PUT_LINE('Inserting audit row for batch: ' || '$$BATCH_ID');
+        END;
+
+        -- AFTER JOB: Update audit record with counters and status
+        BEGIN
+          DBMS_OUTPUT.PUT_LINE('Updating audit row for batch: ' || '$$BATCH_ID');
+        END;
+      ]]>
+    </JobControl>
+
+    <!-- Documentation -->
+    <Documentation>
+      <![CDATA[
+        SCD2_DIM_POLICY - Full Parallel Job Export
+        - Job implements SCD Type 2 for DIM_POLICY using Oracle connectors.
+        - Includes audit insert (before job) and audit update (after job) using ETL_AUDIT_LOG.
+        - Parameters: SRC_CONN, TGT_CONN, RUN_DATE (YYYY-MM-DD), COMMIT_BATCH, LOG_PATH, BATCH_ID
+        - Steps after import:
+          1. Update DataStage connection objects referenced by $$SRC_CONN and $$TGT_CONN.
+          2. Validate Oracle stored procedure stage compatibility and adjust CallSQL if required.
+          3. Compile job, test in DEV using a small RUN_DATE and sample data.
+      ]]>
+    </Documentation>
+
+  </Job>
+</DSX>

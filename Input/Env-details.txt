@@ -1,0 +1,26 @@
+Environment: Snowflake + dbt Cloud
+Execution Type: Cloud-hosted dbt transformation with Snowflake warehouse
+Compute Tier: Snowflake Medium Warehouse (4 credits/hour)
+Storage Cost: $23 per TB/month (approx)
+DBT Cloud Runtime Cost: ~$0.35 per run-hour
+
+DataStage (Legacy) Pricing (CUH – Capacity Unit Hour):
+Enterprise CUH Cost: $1.75 – $3.00 per hour
+Average legacy runtime: 1 hour per job
+
+Table Names & Indicative Data Volume:
+RETAIL_DATA_MART: ~600 GB
+Count_Customers_Transactions: ~250 GB
+customer_dim : ~100 GB
+Retail_Dim : ~100 GB
+Transactions_Fact : ~250 GB
+Product_Dim : ~350 GB
+ACTIVATIONSALES_DATA_MART: ~600 GB
+POLICY_SRC: ~600 GB
+DIM_POLICY: ~250 GB
+DIM_POLICY_AUDIT : ~100 GB
+ETL_AUDIT_LOG : ~100 GB
+Processing Notes:
+- Approximately 10% of total data volume is processed per run
+- Transformations include aggregations, joins, and lookups
+- Incremental DBT model expected for CUSTOMER_SUMMARY
